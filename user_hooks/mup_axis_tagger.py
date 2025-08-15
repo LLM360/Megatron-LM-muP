@@ -243,7 +243,7 @@ def build_param_groups_from_tags(
         lname = name.lower()
         wd = 0.0 if (p.ndim <= 1 or "norm" in lname) else weight_decay
         lr_mult = float(getattr(p, "mup_lr_mult", 1.0))
-        sig = (round(base_lr * lr_mult, 12), round(wd, 12))
+        sig = (round(base_lr * lr_mult, ROUND_PRECISION), round(wd, ROUND_PRECISION))
         group = buckets.setdefault(sig, {"params": [], "lr": sig[0], "weight_decay": sig[1]})
         group["params"].append(p)
     return list(buckets.values())
