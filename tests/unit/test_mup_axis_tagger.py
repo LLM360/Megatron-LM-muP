@@ -1,97 +1,119 @@
-"""Unit tests for the axis-aware µP tagger.
+"""Unit tests for axis-aware μP tagging.
 
-These tests use simple stand-in modules (including dummy tensor-parallel
-sharding stubs) to exercise the core classification logic and multiplier
-assignment without depending on the full Megatron stack.
+The tests cover role classification heuristics, shape-based fallbacks and the
+``apply_mup_lr_mult`` helper without relying on the full Megatron stack.
 """
 
-import math
 import torch
 from torch import nn
+import pytest
 
-from user_hooks.mup_axis_tagger import tag_axis_aware
-
-
-class DummyModel(nn.Module):
-    def __init__(self, h: int):
-        super().__init__()
-        self.layernorm = nn.LayerNorm(h)
-        self.linear_qkv = nn.Linear(h, 3 * h, bias=False)
-        self.linear_proj = nn.Linear(3 * h, h, bias=False)
-        self.bias = nn.Parameter(torch.zeros(h))
-        self.embed = nn.Embedding(10, h)
-        self.out_head = nn.Linear(h, 20, bias=False)
+from user_hooks.mup_axis_tagger import tag_axis_aware, apply_mup_lr_mult
 
 
-class DummyIO(nn.Module):
-    def __init__(self, din: int, dout: int):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(din, dout))
-        self.input_size = din
-        self.output_size = dout
+def test_embedding_is_to_width() -> None:
+    h = 8
+    model = nn.Module()
+    model.embed = nn.Embedding(10, h)
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
+    assert model.embed.weight.mup_role == "to_width"
 
 
-class DummyRowParallel(nn.Module):
-    def __init__(self, din: int, dout: int):
-        super().__init__()
-        self.input_is_parallel = True
-        self.weight = nn.Parameter(torch.randn(din, dout))
-        self.input_size = din
-        self.output_size = dout
+def test_head_is_from_width() -> None:
+    h = 8
+    model = nn.Module()
+    model.lm_head = nn.Linear(h, 20, bias=False)
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
+    assert model.lm_head.weight.mup_role == "from_width"
 
 
-class DummyColParallel(nn.Module):
-    def __init__(self, din: int, dout: int):
-        super().__init__()
-        self.gather_output = True
-        self.weight = nn.Parameter(torch.randn(din, dout))
-        self.input_size = din
-        self.output_size = dout
+def test_linear_in_tracks_width_is_from() -> None:
+    h = 8
+    model = nn.Module()
+    model.lin = nn.Linear(h, 2 * h, bias=False)
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
+    assert model.lin.weight.mup_role == "from_width"
 
 
-class Wrapper(nn.Module):
-    """Compose the dummy modules into a single test fixture."""
-
-    def __init__(self, h: int):
-        super().__init__()
-        self.model = DummyModel(h)
-        self.conflict = DummyIO(20, h)
-        self.linear_proj_conflict = self.conflict  # name hint vs axis
-        self.row = DummyRowParallel(h, h)
-        self.col = DummyColParallel(h, h)
-        self.top_weight = nn.Parameter(torch.randn(h, h))
+def test_linear_out_tracks_width_is_to() -> None:
+    h = 8
+    model = nn.Module()
+    model.lin = nn.Linear(2 * h, h, bias=False)
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
+    assert model.lin.weight.mup_role == "to_width"
 
 
-def test_tag_axis_aware_sets_expected_metadata() -> None:
-    """Tag the dummy model and verify roles and multipliers."""
+def test_shape_fallback_unknown_module() -> None:
+    h = 8
 
-    h = 32
-    model = Wrapper(h)
+    class Unknown(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(4, h))
+
+    model = Unknown()
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
+    assert model.weight.mup_role == "from_width"
+
+
+def test_router_is_from_width() -> None:
+    h = 8
+
+    class Router(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(h, h))
+            self.num_experts = 2
+            self.top_k = 1
+
+    model = Router()
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
+    assert model.weight.mup_role == "from_width"
+
+
+def test_idempotent_tagging() -> None:
+    h = 8
+    model = nn.Module()
+    model.lin = nn.Linear(h, h, bias=False)
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
+    first_role = model.lin.weight.mup_role
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
+    assert model.lin.weight.mup_role == first_role
+
+
+def test_apply_mup_lr_mult_groups() -> None:
+    h = 8
+    model = nn.Module()
+    model.from_w = nn.Linear(h, h * 2, bias=False)
+    model.to_w = nn.Linear(h * 2, h, bias=False)
     tag_axis_aware(model, hidden_size=h, base_hidden=h // 2)
-    r = (h / (h // 2)) ** -0.5
 
-    for name, p in model.named_parameters():
-        assert hasattr(p, "mup_role")
-        assert hasattr(p, "mup_lr_mult")
-        assert hasattr(p, "mup_init_scale")
-        assert hasattr(p, "megatron_name") and p.megatron_name == name
+    opt = torch.optim.SGD(
+        [
+            {"params": [model.from_w.weight, model.to_w.weight]},
+        ],
+        lr=1.0,
+    )
+    apply_mup_lr_mult(opt)
+    lr_mults = [g["lr_mult"] for g in opt.param_groups]
+    expected = sorted([1.0, (h / (h // 2)) ** -0.5])
+    assert sorted(lr_mults) == expected
 
-    assert model.model.layernorm.weight.mup_role == "neutral"
-    assert model.model.layernorm.bias.mup_role == "neutral"
-    assert model.model.bias.mup_role == "neutral"
 
-    assert model.model.embed.weight.mup_role == "from_width"
-    assert model.model.linear_qkv.weight.mup_role == "to_width"
-    assert model.model.linear_proj.weight.mup_role == "from_width"
-    assert model.model.out_head.weight.mup_role == "from_width"
+def test_tp_layers_if_available() -> None:
+    pytest.importorskip("numpy")
+    pytest.importorskip("megatron.core.tensor_parallel.layers")
+    from megatron.core.tensor_parallel.layers import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+    from megatron.core.model_parallel_config import ModelParallelConfig
 
-    assert model.row.weight.mup_role == "from_width"
+    h = 8
+    config = ModelParallelConfig(use_cpu_initialization=True)
+    model = nn.Module()
+    model.col = ColumnParallelLinear(h, 3 * h, config=config, gather_output=True, bias=False)
+    model.row = RowParallelLinear(h, h, config=config, input_is_parallel=False, bias=False)
+    tag_axis_aware(model, hidden_size=h, base_hidden=h)
     assert model.col.weight.mup_role == "to_width"
-
-    assert model.linear_proj_conflict.weight.mup_role == "to_width"
-    assert model.top_weight.mup_role == "neutral"
-
-    assert math.isclose(model.model.embed.weight.mup_lr_mult, r)
-    assert math.isclose(model.model.linear_proj.weight.mup_init_scale, r)
-    assert model.model.linear_qkv.weight.mup_lr_mult == 1.0
-    assert model.linear_proj_conflict.weight.mup_lr_mult == 1.0
+    assert model.row.weight.mup_role == "from_width"

@@ -1,11 +1,10 @@
-"""Axis-aware \u03bcP tagging for Megatron-LM.
+"""Axis-aware \u03bcP tagging utilities.
 
-This module exposes :func:`tag_axis_aware`, a utility that scans a model once
-and attaches micro-parameterization (\u03bcP) metadata to each
-:class:`~torch.nn.Parameter`. The metadata describes how a parameter's axes
-relate to the model's *width* dimension so that downstream components
-(initialization rescaling, optimizer policies, forward multipliers, ...)
-can apply width-aware rules without re-inspecting module structure.
+The :func:`tag_axis_aware` function scans a model once and attaches
+micro-parameterization (\u03bcP) metadata to each :class:`~torch.nn.Parameter`.
+The metadata describes how a parameter's axes relate to the model's *width*
+dimension so that later stages (e.g., optimizer policies or initialization
+rescaling) can apply width-aware rules without re-inspecting module structure.
 
 For every parameter ``p`` the following attributes are created:
 
@@ -17,9 +16,18 @@ For every parameter ``p`` the following attributes are created:
     Recommended learning-rate multiplier. ``1.0`` for most parameters and
     ``r**-0.5`` for ``"from_width"`` parameters where ``r = hidden_size / base_hidden``.
 ``p.mup_init_scale``
-    Initialization-time multiplier (mirrors ``mup_lr_mult`` in this default policy).
+    Initialization-time multiplier (mirrors ``mup_lr_mult`` in this default
+    policy).
 ``p.megatron_name``
     Dotted parameter name as produced by :meth:`~torch.nn.Module.named_parameters`.
+
+Embeddings map vocabulary indices into width space and are therefore tagged
+``"to_width"`` even when their weights are reused as a readout layer (tied
+embeddings). Output heads and routing/gating modules are tagged
+``"from_width"``.
+
+Use :func:`apply_mup_lr_mult` to surface the ``mup_lr_mult`` attribute to a
+``torch.optim.Optimizer`` via its ``lr_mult`` param-group field.
 
 Example
 -------
@@ -35,7 +43,7 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 
-__all__ = ["tag_axis_aware"]
+__all__ = ["tag_axis_aware", "apply_mup_lr_mult"]
 
 try:  # pragma: no cover - optional import
     # Megatron-Core provides metadata-rich parallel linear layers.  We only
@@ -102,10 +110,15 @@ def _is_multiple_or_equal(x: int, y: int) -> bool:
 
     if x <= 0 or y <= 0:
         return False
-    return x == y or x % y == 0 or y % x == 0
+    return x == y or y % x == 0
 
 
-def tag_axis_aware(model: nn.Module, hidden_size: int, base_hidden: int) -> None:
+def tag_axis_aware(
+    model: nn.Module,
+    hidden_size: int,
+    base_hidden: int,
+    extra_hints: Optional[Dict[str, Role]] = None,
+) -> None:
     """Attach \u03bcP width metadata to every parameter.
 
     Parameters
@@ -118,6 +131,9 @@ def tag_axis_aware(model: nn.Module, hidden_size: int, base_hidden: int) -> None
         Reference width of the base model. ``r = hidden_size / base_hidden``
         feeds into the default \u03bcP scaling rule ``r**-0.5`` for ``from_width``
         parameters.
+    extra_hints : dict[str, Role], optional
+        Mapping from lowercase substrings to explicit roles. These hints are
+        consulted *last*, after all structural and shape-based rules.
 
     Notes
     -----
@@ -157,20 +173,19 @@ def tag_axis_aware(model: nn.Module, hidden_size: int, base_hidden: int) -> None
         if p.ndim <= 1 or "norm" in lname or "position" in lname or "pos_emb" in lname:
             return "neutral"
 
-        # 2. Embeddings, output heads and routing/gating modules *consume* width
-        #    and therefore scale with ``r**-0.5``.
-        if isinstance(parent, nn.Embedding) or any(
-            t in lname
-            for t in (
-                "embedding",
-                "embed",
-                "lm_head",
-                "output_layer",
-                "readout",
-                "router",
-                "gating",
-            )
-        ):
+        # 2. Embeddings map vocab -> width (to_width). Output heads and routing
+        #    modules consume width (from_width).
+        if isinstance(parent, nn.Embedding) or "embedding" in lname or "embed" in lname:
+            return "to_width"
+
+        if any(t in lname for t in ("lm_head", "output_layer", "readout")):
+            return "from_width"
+
+        if (
+            parent is not None
+            and hasattr(parent, "num_experts")
+            and hasattr(parent, "top_k")
+        ) or "router" in lname or "gating" in lname:
             return "from_width"
 
         # 3. Explicit tensor-parallel modules provide the clearest signal.
@@ -179,9 +194,7 @@ def tag_axis_aware(model: nn.Module, hidden_size: int, base_hidden: int) -> None
         if _is_col_parallel(parent):
             return "to_width"
 
-        # 4. Fall back to structural metadata (input/output dimensions) when
-        #    available.  A parameter whose *input* dimension tracks width is
-        #    ``from_width``; one whose *output* tracks width is ``to_width``.
+        # 4. Use structural metadata (input/output dims) when available.
         din = dout = None
         if parent is not None:
             din = getattr(parent, "input_size", getattr(parent, "in_features", None))
@@ -193,31 +206,32 @@ def tag_axis_aware(model: nn.Module, hidden_size: int, base_hidden: int) -> None
         if dout_tracks and not din_tracks:
             return "to_width"
 
-        # 5. Finally fall back to lightweight name-based hints for common
-        #    patterns. These are intentionally coarse and only trigger when all
-        #    above checks fail.
-        if any(
-            h in lname
-            for h in (
-                "linear_proj",
-                "attention.dense",
-                "down_proj",
-                "o_proj",
-                "linear_fc2",
-            )
-        ):
-            return "from_width"
-        if any(
-            h in lname
-            for h in (
-                "query_key_value",
-                "linear_qkv",
-                "up_proj",
-                "gate_proj",
-                "linear_fc1",
-            )
-        ):
-            return "to_width"
+        # 5. Shape-based fallback for generic 2-D parameters.
+        if p.ndim == 2:
+            # Without metadata we only trust exact matches for width-tracking.
+            in_tracks = p.shape[1] == hidden_size
+            out_tracks = p.shape[0] == hidden_size
+            if in_tracks and not out_tracks:
+                return "from_width"
+            if out_tracks and not in_tracks:
+                return "to_width"
+
+        # 6. Final name-based hints (built-in + user-provided).
+        hints: Dict[str, Role] = {
+            "up_proj": "to_width",
+            "gate_proj": "to_width",
+            "qkv": "to_width",
+            "query_key_value": "to_width",
+            "linear_qkv": "to_width",
+            "down_proj": "from_width",
+            "o_proj": "from_width",
+        }
+        if extra_hints:
+            hints.update({k.lower(): v for k, v in extra_hints.items()})
+
+        for key, role in hints.items():
+            if key in lname:
+                return role
 
         return "neutral"
 
@@ -235,3 +249,42 @@ def tag_axis_aware(model: nn.Module, hidden_size: int, base_hidden: int) -> None
         setattr(p, "mup_init_scale", float(mult))
         if not hasattr(p, "megatron_name"):
             setattr(p, "megatron_name", name)
+
+
+def apply_mup_lr_mult(optimizer: torch.optim.Optimizer) -> None:
+    """Write ``lr_mult`` fields in an optimizer's param groups.
+
+    Each parameter's ``mup_lr_mult`` attribute is surfaced as a param-group
+    ``lr_mult`` so that Megatron's optimizer and scheduler machinery can read
+    it natively. Groups containing parameters with mixed multipliers are split
+    to preserve correctness.
+
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        Optimizer whose ``param_groups`` will be annotated in-place.
+    """
+
+    new_groups = []
+    for group in list(optimizer.param_groups):
+        params = group.get("params", [])
+        multipliers = {}
+        for p in params:
+            m = float(getattr(p, "mup_lr_mult", 1.0))
+            multipliers.setdefault(m, []).append(p)
+
+        if len(multipliers) <= 1:
+            group.setdefault("lr_mult", next(iter(multipliers.keys())) if multipliers else 1.0)
+            continue
+
+        base = {k: v for k, v in group.items() if k != "params"}
+        first_mult, first_params = next(iter(multipliers.items()))
+        group["params"] = first_params
+        group["lr_mult"] = first_mult
+        for mult, ps in list(multipliers.items())[1:]:
+            ng = base.copy()
+            ng["params"] = ps
+            ng["lr_mult"] = mult
+            new_groups.append(ng)
+
+    optimizer.param_groups.extend(new_groups)

@@ -46,8 +46,8 @@ def test_tag_axis_aware_handles_named_parameter_types() -> None:
 
             roles = {n: p.mup_role for n, p in model.named_parameters()}
 
-            # Embedding and readout parameters consume width.
-            assert roles["embedding.word_embeddings.weight"] == "from_width"
+            # Embedding projects into width; readout projects out of it.
+            assert roles["embedding.word_embeddings.weight"] == "to_width"
             assert roles["output_layer.weight"] == "from_width"
 
             # Attention projections.
