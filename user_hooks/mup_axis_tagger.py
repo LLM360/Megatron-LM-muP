@@ -61,7 +61,8 @@ def _is_col_parallel(module: Optional[nn.Module]) -> bool:
         if ColumnParallelLinear is not None and isinstance(module, ColumnParallelLinear):
             return True
     except Exception:
-        pass
+    except ImportError as e:
+        print(f"Optional import failed in _is_col_parallel: {e}")
     return bool(getattr(module, "gather_output", False))
 
 
