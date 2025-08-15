@@ -33,7 +33,7 @@ try:  # pragma: no cover - optional import
         ColumnParallelLinear,
         RowParallelLinear,
     )
-except Exception:  # pragma: no cover - optional import
+except ImportError:  # pragma: no cover - optional import
     ColumnParallelLinear = None  # type: ignore
     RowParallelLinear = None  # type: ignore
 
