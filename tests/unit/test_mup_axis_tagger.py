@@ -1,3 +1,10 @@
+"""Unit tests for the axis-aware µP tagger.
+
+These tests use simple stand-in modules (including dummy tensor-parallel
+sharding stubs) to exercise the core classification logic and multiplier
+assignment without depending on the full Megatron stack.
+"""
+
 import math
 import torch
 from torch import nn
@@ -43,6 +50,8 @@ class DummyColParallel(nn.Module):
 
 
 class Wrapper(nn.Module):
+    """Compose the dummy modules into a single test fixture."""
+
     def __init__(self, h: int):
         super().__init__()
         self.model = DummyModel(h)
@@ -53,7 +62,9 @@ class Wrapper(nn.Module):
         self.top_weight = nn.Parameter(torch.randn(h, h))
 
 
-def test_tag_axis_aware_sets_expected_metadata():
+def test_tag_axis_aware_sets_expected_metadata() -> None:
+    """Tag the dummy model and verify roles and multipliers."""
+
     h = 32
     model = Wrapper(h)
     tag_axis_aware(model, hidden_size=h, base_hidden=h // 2)

@@ -1,3 +1,5 @@
+"""Integration test covering Megatron-Core tensor-parallel layers."""
+
 import torch
 from torch import nn
 import pytest
@@ -12,6 +14,8 @@ except Exception as exc:  # pragma: no cover
 
 
 class TinyMegatron(nn.Module):
+    """Minimal module composed of Megatron's parallel linear layers."""
+
     def __init__(self, h: int, config: ModelParallelConfig):
         super().__init__()
         self.qkv = ColumnParallelLinear(
@@ -33,7 +37,9 @@ class TinyMegatron(nn.Module):
         )
 
 
-def test_tag_axis_aware_with_megatron_layers():
+def test_tag_axis_aware_with_megatron_layers() -> None:
+    """The tagger should recognize tensor-parallel sharding semantics."""
+
     config = ModelParallelConfig(use_cpu_initialization=True)
     model = TinyMegatron(8, config)
     tag_axis_aware(model, hidden_size=8, base_hidden=8)
