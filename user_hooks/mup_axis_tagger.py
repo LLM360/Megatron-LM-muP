@@ -49,7 +49,7 @@ def _is_row_parallel(module: Optional[nn.Module]) -> bool:
         if RowParallelLinear is not None and isinstance(module, RowParallelLinear):
             return True
     except Exception:
-        pass
+        logging.debug("Exception in _is_row_parallel: ", exc_info=True)
     return bool(getattr(module, "input_is_parallel", False))
 
 
